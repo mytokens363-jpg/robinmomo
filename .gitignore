@@ -1,0 +1,29 @@
+# secrets — NEVER commit
+.env
+secrets/
+*.token
+*token*.json
+rh_token.json
+
+# runtime state (live positions, kill switch, high-water marks)
+state/
+*_state.json
+
+# data + result artifacts (regenerate; don't version)
+*.csv
+*.png
+*.parquet
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
