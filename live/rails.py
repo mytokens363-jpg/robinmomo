@@ -6,7 +6,7 @@ The runner calls these; the proxy SHOULD also enforce the allow-list independent
 so a bug in the runner can't place an off-list order. Defense in depth.
 """
 from __future__ import annotations
-import calendar, datetime as dt
+import calendar, datetime as dt, sys
 
 from strategy.config import (
     UNIVERSE, PER_LEG_MAX_FRACTION, DAILY_LOSS_KILL_PCT, NO_TRADE_BAND, NO_MARGIN,
@@ -17,17 +17,43 @@ class RailBreach(Exception):
     """Raised for a breach that should HALT the run (e.g. daily-loss kill)."""
 
 
-def is_rebalance_day(today: dt.date | None = None) -> bool:
-    """True only on the last trading day of the month (Mon-Fri approximation;
-    holidays are handled by the fact that the runner also checks last_rebalance
-    so it won't double-fire). Frozen cadence — see config note."""
-    today = today or dt.date.today()
-    last_dom = calendar.monthrange(today.year, today.month)[1]
-    # walk back from month end to the last weekday
-    d = dt.date(today.year, today.month, last_dom)
-    while d.weekday() >= 5:            # Sat=5, Sun=6
+_CAL_WARNED = False
+
+
+def _last_trading_day_of_month(year: int, month: int) -> dt.date:
+    """Last NYSE trading day of the month. Uses the real exchange calendar
+    (holidays + early closes) when pandas_market_calendars is available; falls
+    back to a weekday walk with a LOUD warning otherwise — a silent fallback
+    would re-introduce exactly the holiday bug this function exists to kill."""
+    global _CAL_WARNED
+    last_dom = calendar.monthrange(year, month)[1]
+    try:
+        import pandas_market_calendars as mcal
+        nyse = mcal.get_calendar("XNYS")
+        days = nyse.valid_days(start_date=f"{year}-{month:02d}-01",
+                               end_date=f"{year}-{month:02d}-{last_dom:02d}")
+        if len(days):
+            return days[-1].date()
+        # no trading days in range should be impossible; fall through to walk
+    except Exception as e:
+        if not _CAL_WARNED:
+            print(f"[rails] WARNING: NYSE calendar unavailable ({e}); falling back to "
+                  f"weekday approximation — holiday-adjacent month-ends may misfire. "
+                  f"Install pandas_market_calendars to fix.", file=sys.stderr)
+            _CAL_WARNED = True
+    # fallback: walk back from month end to the last weekday
+    d = dt.date(year, month, last_dom)
+    while d.weekday() >= 5:
         d -= dt.timedelta(days=1)
-    return today == d
+    return d
+
+
+def is_rebalance_day(today: dt.date | None = None) -> bool:
+    """True only on the last NYSE trading day of the month. Frozen cadence —
+    the sweep showed the rebalance date is sensitive, so this is enforced.
+    The runner also checks last_rebalance, so it can never double-fire."""
+    today = today or dt.date.today()
+    return today == _last_trading_day_of_month(today.year, today.month)
 
 
 def filter_no_trade_band(orders: list[dict]) -> list[dict]:
