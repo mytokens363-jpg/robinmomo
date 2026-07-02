@@ -30,6 +30,8 @@ from strategy.signal import compute_target_weights
 from strategy import data
 from live import state as st
 from live import rails
+from live import notify
+from proxy import mcp_proxy
 
 
 def _log(msg: str) -> None:
@@ -79,12 +81,19 @@ def execute_orders(orders: list[dict], *, dry_run: bool, account_equity: float) 
         _log("DRY-RUN: nothing sent. (set --live AND LIVE_TRADING=true to arm)")
         return
 
-    # --- LIVE PATH (stub) ---------------------------------------------------
+    # --- LIVE PATH ----------------------------------------------------------
     if os.environ.get("LIVE_TRADING") != "true":
         raise SystemExit("refusing to trade: LIVE_TRADING != true")
-    raise NotImplementedError(
-        "Live execution not wired. Drop the MCP proxy client call here once the "
-        "Agentic Trading account exists and proxy/mcp_proxy.py is configured.")
+    for o in orders:
+        amount = abs(o["notional_fraction"]) * account_equity
+        broker_order = {
+            "symbol": o["symbol"],
+            "side": o["side"],
+            "amount": round(amount, 2),     # dollar-based; confirm param name vs RH schema
+            "type": "market",
+        }
+        result = mcp_proxy.review_then_place(broker_order)
+        _log(f"placed {o['side']} {o['symbol']} ~${amount:,.0f} -> {result}")
 
 
 def run(source: str, seed: int, live: bool) -> None:
@@ -96,10 +105,15 @@ def run(source: str, seed: int, live: bool) -> None:
     else:
         daily = data.load_synthetic(seed=seed)
 
-    # placeholder equity + positions: live mode will read these from the broker
-    # via the proxy (get-account / get-positions). Dry-run uses state + a nominal.
+    # equity + positions: live mode reads them from the broker via the proxy;
+    # dry-run uses a nominal equity and last-known positions from state.
     state = st.load()
-    account_equity = float(os.environ.get("ROBINMOMO_NOMINAL_EQUITY", "10000"))
+    if live:
+        account_equity = mcp_proxy.get_account_equity()
+        live_positions = mcp_proxy.get_positions()
+        state["positions"] = {s: {"weight": w, "qty": None} for s, w in live_positions.items()}
+    else:
+        account_equity = float(os.environ.get("ROBINMOMO_NOMINAL_EQUITY", "10000"))
 
     # 2. daily-loss / kill rails (run EVERY invocation, not just rebalance days)
     state = st.roll_day(state, account_equity)
@@ -109,6 +123,7 @@ def run(source: str, seed: int, live: bool) -> None:
     except rails.RailBreach as e:
         state = st.latch_kill(state, str(e))
         _log(f"HALT — {e}")
+        notify.halt(str(e))
         st.save(state)
         return
 
@@ -117,6 +132,8 @@ def run(source: str, seed: int, live: bool) -> None:
     if not rails.is_rebalance_day(today):
         _log(f"not a rebalance day ({today}); monitor-only. last_rebalance="
              f"{state.get('last_rebalance')}")
+        if os.environ.get("ROBINMOMO_HEARTBEAT") == "1":
+            notify.heartbeat(today.isoformat(), state.get("last_rebalance"))
         st.save(state)
         return
     if state.get("last_rebalance") == today.isoformat():
@@ -146,11 +163,13 @@ def run(source: str, seed: int, live: bool) -> None:
     except rails.RailBreach as e:
         state = st.latch_kill(state, str(e))
         _log(f"HALT — rail breach: {e}")
+        notify.halt(f"rail breach: {e}")
         st.save(state)
         return
 
     # 7. execute (stubbed)
     execute_orders(orders, dry_run=dry_run, account_equity=account_equity)
+    notify.rebalance(target, orders, account_equity)
 
     # record intent in state (dry-run still records target so diffs are realistic)
     state["positions"] = {s: {"weight": w, "qty": None} for s, w in target.items()}
