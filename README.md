@@ -17,7 +17,8 @@ strategy/   config.py   frozen, validated params + rail limits
 live/       runner.py   deterministic loop: signal -> diff -> rails -> execute(stub)
             rails.py    hard gates: allow-list, per-leg cap, daily-loss kill, cadence
             state.py    on-disk positions / kill switch / high-water mark
-proxy/      mcp_proxy.py local MCP proxy skeleton (forwards to RH, re-enforces allow-list)
+proxy/      mcp_proxy.py local MCP proxy (gates + review-then-place + read helpers)
+            client.py    low-level streamable-HTTP MCP client (network send stubbed)
             oauth.py     OAuth token holder/refresh (stub)
 ```
 
@@ -32,16 +33,32 @@ Validated edge: cut historical max drawdown ~23 pts for ~0.4 pts of CAGR, higher
 Known blind spot: a 12-month absolute filter is slow against fast V-shaped crashes (2020).
 Size the account to the real max drawdown, not the CAGR.
 
-## Two-layer safety
+## Three-layer safety
 
-Every order is gated **twice**: once in `live/rails.py` (runner) and again in
-`proxy/mcp_proxy.py` (proxy). A bug in one layer can't place an off-list, oversized,
-short, or post-kill order. Nothing reaches Robinhood unless:
+Every order is gated **three** times:
+
+1. `live/rails.py` (runner) — allow-list, per-leg cap, no-short, daily-loss kill, cadence.
+2. `proxy/mcp_proxy.py` (proxy) — independent allow-list + no-short + kill flag, so a
+   runner bug can't place an off-list/short/post-kill order.
+3. `review_equity_order` (Robinhood, native) — `review_then_place()` simulates the
+   order via RH's own pre-trade review, inspects the returned warnings, and only then
+   calls `place_equity_order`. Blocking warnings (insufficient funds, restricted,
+   halted, margin, PDT, etc.) abort placement.
+
+Nothing reaches Robinhood unless:
 
 1. `--live` is passed, **and**
 2. env `LIVE_TRADING=true`, **and**
-3. the kill switch is clear, **and**
-4. every order passes both rail layers.
+3. neither kill switch (runner or proxy) is set, **and**
+4. every order passes all three layers.
+
+## Tool surface
+
+Built against the community-documented June 2026 RH equity surface (`proxy/client.py`):
+reads (`get_accounts`, `get_equity_positions`, `get_equity_quotes`, ...), watchlist,
+and trade (`review_equity_order`, `place_equity_order`, `cancel_equity_order`).
+**Confirm these by a live tool-surface audit before arming** — ask the connected
+agent to list its tools and diff against `client.TOOLS`.
 
 ## Run
 
@@ -72,8 +89,14 @@ is permanent.
 ## What's left before live
 
 1. Open + authenticate the Robinhood Agentic **Trading** account (separate product
-   from the Gold/Agentic Credit Card).
-2. Confirm RH MCP tool names/schemas; implement `proxy.forward()` and `oauth` refresh.
-3. Point `execute_orders()` in `runner.py` at the proxy.
+   from the Gold/Agentic Credit Card). [application pending]
+2. Save the OAuth tokens from the browser consent into `secrets/rh_token.json`;
+   implement token refresh in `proxy/oauth.py` against the confirmed RH token endpoint.
+3. Drop the `httpx` POST into `proxy/client.call_tool()` (one marked block) and run
+   the tool-surface audit to confirm the verb names + the `place_equity_order` /
+   `review_equity_order` arg schema (esp. dollar `amount` vs `quantity`).
 4. Fund with throwaway size; watch one full month-end cycle in dry-run first.
+
+Tool names, the review-then-place gate, read helpers, and the live execution path
+are already wired — steps 2–3 are the only remaining glue, and both need the account.
 ```
