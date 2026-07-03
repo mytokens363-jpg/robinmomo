@@ -15,10 +15,10 @@ Tool names are the community-documented June 2026 surface and MUST be confirmed 
 a live tool-surface audit before arming. See proxy/client.py.
 """
 from __future__ import annotations
-import os
+import os, uuid
 
 from strategy.config import UNIVERSE
-from proxy import client
+from proxy import client, oauth
 
 ORDER_TOOL = "place_equity_order"
 REVIEW_TOOL = "review_equity_order"
@@ -45,7 +45,9 @@ def _symbol_of(args: dict) -> str | None:
 
 
 def _validate_order(tool: str, args: dict) -> None:
-    """Independent allow-list + no-short gate, mirroring live/rails.py."""
+    """Independent allow-list + no-short + agentic-account gate, mirroring
+    live/rails.py. The broker also fences to agentic_allowed=true; this is
+    defense in depth so a misconfigured call fails fast without hitting RH."""
     sym = _symbol_of(args)
     if sym is None:
         raise ProxyKill(f"{tool}: no symbol in args — refusing")
@@ -53,6 +55,12 @@ def _validate_order(tool: str, args: dict) -> None:
         raise ProxyKill(f"{tool}: {sym} not in allow-list — refusing")
     if str(args.get("side", "")).lower() in {"sell_short", "short"}:
         raise ProxyKill(f"{tool}: shorting not permitted")
+    acct = args.get("account_number")
+    if acct is not None:
+        agentic = oauth.get_agentic_account_number()
+        if acct != agentic:
+            raise ProxyKill(
+                f"{tool}: account_number {acct} != agentic account {agentic} — refusing")
 
 
 # ---- low-level forward ----------------------------------------------------
@@ -144,40 +152,69 @@ def _is_blocked(review: dict) -> str | None:
     return hit
 
 
+def _prepare_order(order: dict, *, for_place: bool) -> dict:
+    """Inject the fields the runner is not permitted to set — account_number
+    (agentic-only, from env, never trust caller), market_hours, time_in_force,
+    and (for place only) ref_id. Reject any caller-supplied account_number
+    that isn't the agentic account."""
+    agentic = oauth.get_agentic_account_number()
+    supplied = order.get("account_number")
+    if supplied is not None and supplied != agentic:
+        raise ProxyKill(
+            f"caller supplied account_number {supplied} != agentic {agentic} — refusing")
+    prepared = dict(order)
+    prepared["account_number"] = agentic
+    prepared.setdefault("time_in_force", "gfd")
+    prepared.setdefault("market_hours", "regular_hours")
+    if for_place:
+        prepared.setdefault("ref_id", str(uuid.uuid4()))
+    else:
+        prepared.pop("ref_id", None)  # review schema has no ref_id
+    return prepared
+
+
 def review_then_place(order: dict) -> dict:
     """Pre-trade gate: review_equity_order -> inspect warnings -> place_equity_order.
 
-    `order` is the broker-ready arg dict (symbol/side/amount|quantity/type/...).
-    Exact param names must be confirmed against RH's schema; this routes them
-    through unchanged so confirming the schema is a one-place edit.
-    """
-    _validate_order(ORDER_TOOL, order)
+    `order` from the runner carries only {symbol, side, type, dollar_amount}.
+    This proxy injects account_number + ref_id + tif + market_hours. Any caller-
+    supplied account_number that isn't the agentic account is rejected. If
+    review_equity_order flags a blocking warning, place is skipped."""
+    review_order = _prepare_order(order, for_place=False)
+    _validate_order(REVIEW_TOOL, review_order)
 
-    review = forward(REVIEW_TOOL, order)
+    review = forward(REVIEW_TOOL, review_order)
     blocker = _is_blocked(review)
     if blocker:
-        raise ProxyKill(f"review_equity_order flagged '{blocker}' — not placing {order.get('symbol')}")
+        raise ProxyKill(
+            f"review_equity_order flagged '{blocker}' — not placing {review_order.get('symbol')}")
 
-    return forward(ORDER_TOOL, order)
+    place_order = _prepare_order(order, for_place=True)
+    _validate_order(ORDER_TOOL, place_order)
+    return forward(ORDER_TOOL, place_order)
 
 
 if __name__ == "__main__":
     # Gate smoke test — no network. Confirms validation fires before any send.
+    # In Path 1 the "send" step raises Path1Error; expected for allowed cases.
+    _EXPECTED = (ProxyKill, client.Path1Error, client.MCPError,
+                 NotImplementedError, FileNotFoundError, RuntimeError)
     print("== order-tool gates ==")
     for tool, args, label in [
-        (ORDER_TOOL, {"symbol": "XLK", "side": "buy", "amount": 100}, "allowed symbol"),
-        (ORDER_TOOL, {"symbol": "TSLA", "side": "buy", "amount": 100}, "off-list symbol"),
-        (ORDER_TOOL, {"symbol": "XLF", "side": "short", "amount": 100}, "short attempt"),
-        (ORDER_TOOL, {"side": "buy", "amount": 100}, "missing symbol"),
+        (ORDER_TOOL, {"symbol": "XLK", "side": "buy", "dollar_amount": "100.00"}, "allowed symbol"),
+        (ORDER_TOOL, {"symbol": "TSLA", "side": "buy", "dollar_amount": "100.00"}, "off-list symbol"),
+        (ORDER_TOOL, {"symbol": "XLF", "side": "short", "dollar_amount": "100.00"}, "short attempt"),
+        (ORDER_TOOL, {"side": "buy", "dollar_amount": "100.00"}, "missing symbol"),
     ]:
         try:
             forward(tool, args)
-        except (ProxyKill, NotImplementedError, FileNotFoundError, client.MCPError) as e:
+        except _EXPECTED as e:
             print(f"  [{label:16}] {type(e).__name__}: {str(e).splitlines()[0]}")
 
     print("== read helpers ==")
-    for fn, label in [(get_account_equity, "get_account_equity"), (get_positions, "get_positions")]:
+    for fn, label in [(get_account_equity, "get_account_equity"),
+                      (get_positions, "get_positions")]:
         try:
-            fn()
-        except (ProxyKill, NotImplementedError, FileNotFoundError, client.MCPError) as e:
+            fn("958884520")
+        except _EXPECTED as e:
             print(f"  [{label:18}] {type(e).__name__}: {str(e).splitlines()[0]}")

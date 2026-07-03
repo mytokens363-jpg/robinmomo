@@ -31,7 +31,7 @@ from strategy import data
 from live import state as st
 from live import rails
 from live import notify
-from proxy import mcp_proxy
+from proxy import client, mcp_proxy, oauth
 
 
 def _log(msg: str) -> None:
@@ -60,12 +60,11 @@ def build_orders(target: dict[str, float], current: dict[str, float]) -> list[di
 
 
 def execute_orders(orders: list[dict], *, dry_run: bool, account_equity: float) -> None:
-    """STUB execution boundary. In dry-run, logs intended orders only.
+    """Log intended orders (dry-run) or route them through review_then_place (live).
 
-    LIVE path is intentionally unimplemented: it must route through proxy/mcp_proxy.py,
-    which holds the Robinhood OAuth token and re-enforces the allow-list. Wiring it
-    requires an open, authenticated Agentic Trading account (does not exist yet).
-    """
+    Live path builds the runner-supplied part of the order dict: symbol, side,
+    type='market', dollar_amount (STRING per RH schema). The proxy injects
+    account_number (agentic-only, from env), ref_id (uuid), tif, market_hours."""
     if not orders:
         _log("no orders after rails — portfolio already at target")
         return
@@ -89,15 +88,27 @@ def execute_orders(orders: list[dict], *, dry_run: bool, account_equity: float) 
         broker_order = {
             "symbol": o["symbol"],
             "side": o["side"],
-            "amount": round(amount, 2),     # dollar-based; confirm param name vs RH schema
             "type": "market",
+            "dollar_amount": f"{round(amount, 2):.2f}",   # RH schema wants a string
         }
         result = mcp_proxy.review_then_place(broker_order)
-        _log(f"placed {o['side']} {o['symbol']} ~${amount:,.0f} -> {result}")
+        _log(f"placed {o['side']} {o['symbol']} ~${amount:,.2f} -> {result}")
+
+
+def _month_key(iso_date: str | None) -> tuple[int, int] | None:
+    if not iso_date:
+        return None
+    try:
+        d = dt.date.fromisoformat(iso_date)
+    except ValueError:
+        return None
+    return d.year, d.month
 
 
 def run(source: str, seed: int, live: bool) -> None:
     dry_run = DRY_RUN_DEFAULT or (not live)
+    today = dt.date.today()
+    is_last_trading_day = rails.is_rebalance_day(today)
 
     # 1. data
     if source == "yfinance":
@@ -105,17 +116,34 @@ def run(source: str, seed: int, live: bool) -> None:
     else:
         daily = data.load_synthetic(seed=seed)
 
-    # equity + positions: live mode reads them from the broker via the proxy;
-    # dry-run uses a nominal equity and last-known positions from state.
     state = st.load()
+
+    # 2. Path-1 liveness precondition (live only): a trivial read confirms the
+    # in-session Robinhood MCP is authed. If the session was logged out, we
+    # alert + record the block + exit non-zero; the next live invocation catches
+    # up via the "owed rebalance" logic below.
     if live:
-        account_equity = mcp_proxy.get_account_equity()
-        live_positions = mcp_proxy.get_positions()
+        agentic = oauth.get_agentic_account_number()
+        try:
+            mcp_proxy.forward("get_accounts", {})
+        except Exception as e:
+            reason = f"RH MCP session down: {type(e).__name__}: {e}"
+            _log(f"HALT — {reason}")
+            state["blocked_reason"] = reason
+            state["blocked_at"] = today.isoformat()
+            notify.halt(f"REBALANCE BLOCKED — {reason}")
+            if is_last_trading_day:
+                notify.heartbeat(today.isoformat(), state.get("last_rebalance"))
+            st.save(state)
+            sys.exit(1)
+
+        account_equity = mcp_proxy.get_account_equity(agentic)
+        live_positions = mcp_proxy.get_positions(agentic)
         state["positions"] = {s: {"weight": w, "qty": None} for s, w in live_positions.items()}
     else:
         account_equity = float(os.environ.get("ROBINMOMO_NOMINAL_EQUITY", "10000"))
 
-    # 2. daily-loss / kill rails (run EVERY invocation, not just rebalance days)
+    # 3. daily-loss / kill rails (run EVERY invocation, not just rebalance days)
     state = st.roll_day(state, account_equity)
     try:
         rails.assert_not_killed(state)
@@ -124,37 +152,50 @@ def run(source: str, seed: int, live: bool) -> None:
         state = st.latch_kill(state, str(e))
         _log(f"HALT — {e}")
         notify.halt(str(e))
-        st.save(state)
-        return
-
-    # 3. cadence guard
-    today = dt.date.today()
-    if not rails.is_rebalance_day(today):
-        _log(f"not a rebalance day ({today}); monitor-only. last_rebalance="
-             f"{state.get('last_rebalance')}")
-        if os.environ.get("ROBINMOMO_HEARTBEAT") == "1":
+        if is_last_trading_day:
             notify.heartbeat(today.isoformat(), state.get("last_rebalance"))
         st.save(state)
         return
-    if state.get("last_rebalance") == today.isoformat():
-        _log("already rebalanced today; skipping")
+
+    # 4. cadence + owed-rebalance catch-up. If the session was down on the last
+    # trading day (or last_rebalance never happened this month), pick it up on
+    # the next live run instead of skipping for the whole month.
+    last_rb = state.get("last_rebalance")
+    last_key = _month_key(last_rb)
+    owed_rebalance = last_key is not None and last_key < (today.year, today.month)
+    should_rebalance = is_last_trading_day or (owed_rebalance and live)
+
+    if not should_rebalance:
+        _log(f"not a rebalance day ({today}); monitor-only. last_rebalance={last_rb}")
+        if os.environ.get("ROBINMOMO_HEARTBEAT") == "1":
+            notify.heartbeat(today.isoformat(), last_rb)
         st.save(state)
         return
+    if last_rb == today.isoformat():
+        _log("already rebalanced today; skipping")
+        if is_last_trading_day:
+            notify.heartbeat(today.isoformat(), last_rb)
+        st.save(state)
+        return
+    if owed_rebalance and not is_last_trading_day:
+        _log(f"owed-rebalance catch-up: last_rebalance={last_rb}, today={today}")
 
-    # 4. signal
+    # 5. signal
     try:
         target = compute_target_weights(daily)
     except ValueError as e:
         _log(f"no action — {e}")
+        if is_last_trading_day:
+            notify.heartbeat(today.isoformat(), last_rb)
         st.save(state)
         return
     _log("target weights: " + ", ".join(f"{k} {v:.0%}" for k, v in sorted(target.items())))
 
-    # 5. diff
+    # 6. diff
     current = {k: v.get("weight", 0.0) for k, v in state.get("positions", {}).items()}
     orders = build_orders(target, current)
 
-    # 6. rails
+    # 7. rails
     try:
         orders = rails.filter_no_trade_band(orders)
         rails.check_allow_list(orders)
@@ -164,16 +205,22 @@ def run(source: str, seed: int, live: bool) -> None:
         state = st.latch_kill(state, str(e))
         _log(f"HALT — rail breach: {e}")
         notify.halt(f"rail breach: {e}")
+        if is_last_trading_day:
+            notify.heartbeat(today.isoformat(), last_rb)
         st.save(state)
         return
 
-    # 7. execute (stubbed)
+    # 8. execute
     execute_orders(orders, dry_run=dry_run, account_equity=account_equity)
     notify.rebalance(target, orders, account_equity)
+    if is_last_trading_day:
+        notify.heartbeat(today.isoformat(), last_rb)
 
     # record intent in state (dry-run still records target so diffs are realistic)
     state["positions"] = {s: {"weight": w, "qty": None} for s, w in target.items()}
     state["last_rebalance"] = today.isoformat()
+    state.pop("blocked_reason", None)
+    state.pop("blocked_at", None)
     st.save(state)
     _log("state updated.")
 
