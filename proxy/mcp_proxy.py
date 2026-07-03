@@ -139,14 +139,46 @@ def get_positions(account_number: str) -> dict[str, float]:
 
 # ---- the trade safety gate ------------------------------------------------
 def _is_blocked(review: dict) -> str | None:
-    """Return a reason string if the review result contains a blocking warning."""
-    warnings = []
+    """Return a reason string if the review result contains a blocking warning.
+
+    The Robinhood equity review response's alert field is data.order_checks —
+    a dict, empty when no blockers — confirmed by a live review on a $2 BIL
+    buy. Inspected here explicitly. If order_checks has any entry, treat as a
+    potential blocker (report the first key as the reason). The historical
+    warnings/alerts/errors/messages key set is kept as a fallback so a surprise
+    schema shape still triggers, and a final substring scan across the whole
+    stringified response catches known blocker tokens no matter where they
+    appear. Belt AND suspenders — this is a money path.
+
+    Reconciliation note: the actual order_checks alert VOCABULARY is still
+    unknown. The live review that revealed the key returned an empty dict, so
+    BLOCKING_WARNINGS tokens (insufficient/margin/halted/…) remain unconfirmed
+    against real alert content. Once a populated review is captured — e.g. an
+    oversized order that trips buying-power — enumerate the real alert keys
+    and tune both the returned reason string and BLOCKING_WARNINGS."""
+    if not isinstance(review, dict):
+        return None
+
+    # 1. Explicit: pull data.order_checks (confirmed real RH schema key).
+    data = review.get("data")
+    if not isinstance(data, dict):
+        data = review
+    order_checks = data.get("order_checks") if isinstance(data, dict) else None
+    if isinstance(order_checks, dict) and order_checks:
+        first_key = next(iter(order_checks))
+        return f"order_checks.{first_key}"
+
+    # 2. Historical fallback key set.
+    warnings: list[str] = []
     for k in ("warnings", "alerts", "errors", "messages"):
-        v = review.get(k) if isinstance(review, dict) else None
+        v = review.get(k)
         if isinstance(v, list):
             warnings += [str(x).lower() for x in v]
         elif isinstance(v, str):
             warnings.append(v.lower())
+
+    # 3. Belt-and-suspenders: substring scan across the whole stringified
+    # response so a surprise key or nested placement still catches known tokens.
     blob = " ".join(warnings) + " " + str(review).lower()
     hit = next((w for w in BLOCKING_WARNINGS if w in blob), None)
     return hit
