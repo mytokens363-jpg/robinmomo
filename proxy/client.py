@@ -19,7 +19,8 @@ from proxy import oauth
 # a direct pull from RH's tool registry.
 TOOLS = {
     "read": {"get_accounts", "get_portfolio", "get_equity_positions",
-             "get_equity_quotes", "get_equity_orders", "search"},
+             "get_equity_quotes", "get_equity_orders", "get_equity_tradability",
+             "search"},
     "watchlist": {"get_watchlists", "add_to_watchlist", "update_watchlist"},
     "trade": {"review_equity_order", "place_equity_order", "cancel_equity_order"},
 }

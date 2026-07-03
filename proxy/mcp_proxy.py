@@ -65,35 +65,67 @@ def forward(tool: str, args: dict) -> dict:
 
 
 # ---- read helpers (let the runner pull real state) ------------------------
-def get_account_equity() -> float:
-    """Total equity of the dedicated Agentic account."""
-    accts = forward("get_accounts", {})
-    # response shape TBD — handle a couple of plausible layouts defensively.
-    if isinstance(accts, dict):
-        for key in ("agentic_account", "account", "accounts"):
-            node = accts.get(key)
-            if isinstance(node, dict) and "equity" in node:
-                return float(node["equity"])
-        if "equity" in accts:
-            return float(accts["equity"])
-    raise client.MCPError(f"could not read equity from get_accounts result: {accts!r}")
+def get_account_equity(account_number: str) -> float:
+    """Total portfolio value the strategy sizes weights against.
+
+    Uses get_portfolio.total_value (the sum-of-asset-class + cash figure the
+    broker itself reports). Falls back to equity_value + cash only if
+    total_value is absent — defensive; the schema documents total_value as
+    always present."""
+    p = forward("get_portfolio", {"account_number": account_number})
+    data = p.get("data", p) if isinstance(p, dict) else None
+    if not isinstance(data, dict):
+        raise client.MCPError(f"unexpected get_portfolio result: {p!r}")
+    if "total_value" in data:
+        return float(data["total_value"])
+    if "equity_value" in data or "cash" in data:
+        return float(data.get("equity_value", 0)) + float(data.get("cash", 0))
+    raise client.MCPError(f"could not read equity from get_portfolio result: {p!r}")
 
 
-def get_positions() -> dict[str, float]:
-    """Current Agentic-account positions as {symbol: market_value_weight}."""
-    pos = forward("get_equity_positions", {})
-    rows = pos.get("positions", pos) if isinstance(pos, dict) else pos
-    out: dict[str, float] = {}
-    total = 0.0
-    tmp = {}
-    for r in (rows or []):
+def get_positions(account_number: str) -> dict[str, float]:
+    """Current positions as {symbol: weight}, weight = market_value / total.
+
+    get_equity_positions returns quantity but no market value; multiply by the
+    live last_trade_price from get_equity_quotes and divide by portfolio total.
+    Empty account -> {}."""
+    pos = forward("get_equity_positions", {"account_number": account_number})
+    rows: list = []
+    if isinstance(pos, dict):
+        data = pos.get("data", pos)
+        if isinstance(data, dict):
+            rows = data.get("positions", []) or []
+    qty: dict[str, float] = {}
+    for r in rows:
         sym = r.get("symbol") or r.get("ticker")
-        mv = float(r.get("market_value", r.get("value", 0.0)))
-        if sym:
-            tmp[sym] = mv
-            total += mv
-    if total > 0:
-        out = {s: v / total for s, v in tmp.items()}
+        q = float(r.get("quantity", 0.0))
+        if sym and q != 0:
+            qty[sym] = q
+    if not qty:
+        return {}
+
+    quotes = forward("get_equity_quotes", {"symbols": list(qty)})
+    prices: dict[str, float] = {}
+    if isinstance(quotes, dict):
+        qdata = quotes.get("data", quotes)
+        if isinstance(qdata, dict):
+            for row in qdata.get("results", []) or []:
+                q = row.get("quote") or {}
+                sym = q.get("symbol")
+                px = q.get("last_trade_price")
+                if sym and px is not None:
+                    prices[sym] = float(px)
+
+    total = get_account_equity(account_number)
+    if total <= 0:
+        raise client.MCPError(f"total portfolio value is {total}; cannot compute weights")
+
+    out: dict[str, float] = {}
+    for sym, q in qty.items():
+        px = prices.get(sym)
+        if px is None:
+            raise client.MCPError(f"no last_trade_price for {sym}")
+        out[sym] = (q * px) / total
     return out
 
 

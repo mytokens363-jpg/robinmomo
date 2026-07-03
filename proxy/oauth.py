@@ -18,6 +18,21 @@ from pathlib import Path
 MCP_TRADING_URL = os.environ.get("RH_MCP_TRADING_URL", "https://agent.robinhood.com/mcp/trading")
 TOKEN_FILE = Path(os.environ.get("RH_TOKEN_FILE", "secrets/rh_token.json"))   # gitignored
 
+# Ring-fenced agentic Trading account number. The real value lives in .env
+# (gitignored) — never hardcoded here, never committed. Every trade tool call
+# routes through this account; a mismatch fails broker-side (agentic_allowed).
+AGENTIC_ACCOUNT_ENV = "AGENTIC_ACCOUNT_NUMBER"
+
+
+def get_agentic_account_number() -> str:
+    """Read the ring-fenced agentic account number from env."""
+    n = os.environ.get(AGENTIC_ACCOUNT_ENV)
+    if not n:
+        raise RuntimeError(
+            f"{AGENTIC_ACCOUNT_ENV} not set. Add it to .env — the real number "
+            f"is your ring-fenced agentic Trading account (agentic_allowed=true).")
+    return n
+
 
 def _read_token_file() -> dict:
     if not TOKEN_FILE.exists():
