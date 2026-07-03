@@ -1,14 +1,14 @@
 """
-OAuth credential handling for the Robinhood Agentic Trading MCP server.
+Path 1 (session-bound official MCP): Robinhood's Agentic Trading auth is
+session-bound — the OAuth consent lives inside the Claude Code session that
+connected the MCP, not in an on-disk token file we can hold and refresh. So in
+Path 1, the token-file + refresh code below is UNUSED. It's kept for reference
+as the shape a future headless (Path 2) mode would need if RH ever exposes a
+standalone token issuance.
 
-SECURITY: nothing in here may ever be committed with real values. Tokens are read
-from the environment / a gitignored token file at runtime. The initial OAuth consent
-is a browser flow (desktop-only) that Robinhood requires when you open/connect the
-Agentic account — that happens ONCE, out of band; this module only persists and
-refreshes the resulting tokens.
-
-Everything below the dashed line is a STUB. The real endpoints, scopes, and refresh
-semantics must be confirmed against Robinhood's MCP docs once the account exists.
+The only live-mode helper in this module is get_agentic_account_number(): the
+ring-fenced account number every trade tool call must target, sourced from
+.env (gitignored) — never hardcoded.
 """
 from __future__ import annotations
 import json, os, time
@@ -34,6 +34,10 @@ def get_agentic_account_number() -> str:
     return n
 
 
+# ---------------------------------------------------------------------------
+# Unused in Path 1 — see module docstring. Kept for a possible future Path 2
+# (standalone headless) implementation once a real token endpoint is confirmed.
+# ---------------------------------------------------------------------------
 def _read_token_file() -> dict:
     if not TOKEN_FILE.exists():
         raise FileNotFoundError(
