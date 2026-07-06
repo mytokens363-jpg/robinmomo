@@ -25,8 +25,17 @@ REVIEW_TOOL = "review_equity_order"
 CANCEL_TOOL = "cancel_equity_order"
 KILL_FLAG_ENV = "ROBINMOMO_PROXY_KILL"     # "1" hard-blocks ALL forwarding
 
-# warning keywords in a review result that BLOCK placement outright.
-# tune against real review_equity_order output once observed.
+# Substring tokens for the belt-and-suspenders (Tier 3) scan of the
+# stringified review response. The PRIMARY gate is _is_blocked's explicit
+# data.order_checks non-empty check (Tier 1, real RH schema); this set is a
+# fallback for surprise-shape alerts that route through a different key.
+#
+# 2026-07-06 vocabulary probe: RH populates order_checks with a top-level
+# alertType string (e.g. "EQUITY_SUITABILITY" on a $1000 review vs ~$498 BP
+# on an INDIVIDUAL account). None of the tokens below match that real alert
+# text — RH uses camelCase / SNAKE_CASE keys that contain none of these
+# substrings. So this set is BEST TREATED AS DOCUMENTATION of historical
+# guesses, not validated vocabulary. Tier 1 is the gate doing real work.
 BLOCKING_WARNINGS = {"insufficient", "rejected", "not_allowed", "margin",
                      "pattern_day_trader", "restricted", "halted"}
 
