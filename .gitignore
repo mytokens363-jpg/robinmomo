@@ -9,6 +9,9 @@ rh_token.json
 state/
 *_state.json
 
+# scheduler logs
+logs/
+
 # data + result artifacts (regenerate; don't version)
 *.csv
 *.png
